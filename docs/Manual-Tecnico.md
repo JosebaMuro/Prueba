@@ -25,8 +25,17 @@ El objetivo era un estudio **100% local, multimodal, multi-agente, con memoria p
                                          ├── memory.py   SQLite (conversaciones) + Qdrant (hechos y documentos)
                                          ├── workspace.py carpeta compartida con protección de rutas
                                          ├── multimodal.py faster-whisper · Piper · visión · ComfyUI
-                                         └── llm.py ───────────► Ollama (chat, herramientas, visión, embeddings)
+                                         └── llm.py ──► engines/ ──► Ollama · llama-server · ONNX Runtime GenAI · OpenVINO GenAI
+                                                                     LiteRT-LM · ExecuTorch · MLC LLM · TensorRT-LLM · Qualcomm Genie
 ```
+
+**Capa de motores (`backend/app/engines/`, v1.3)**
+- `formats.py` reconoce el formato de cada modelo (nombre de Ollama, `.gguf`, carpeta ONNX GenAI con `genai_config.json`, OpenVINO IR, MLC, TensorRT-LLM, Genie con `genie_config.json`, `.pte`, `.litertlm`, Hugging Face).
+- `hardware.py` detecta CPU, RAM, GPUs con su VRAM (registro de Windows, `nvidia-smi`, `/proc`) y NPUs (Intel, AMD, Snapdragon).
+- `__init__.py` elige motor y ubicación por modelo: 1) lo fijado a mano, 2) lo medido con «⚡ Medir» (tokens/s por `motor|ubicación`), 3) una estimación según formato, tamaño y memoria. Los ajustes se guardan en `data/engines.json`.
+- Ubicación: `gpu` (VRAM), `cpu` (RAM), `mixed` (N capas en la GPU; Ollama `num_gpu`, llama-server `-ngl`) o `npu`. ONNX usa proveedores CUDA/DirectML/WebGPU/QNN; OpenVINO, los dispositivos CPU/GPU/NPU; LiteRT-LM, sus backends.
+- Los motores sin herramientas nativas reciben la plantilla Jinja del propio modelo (`tokenizer_config.json` o `chat_template.jinja`) y, si no admite herramientas, se describen en el prompt de sistema; las llamadas se extraen del texto (`<tool_call>`, `<|python_tag|>`, JSON…).
+- Los paquetes de Python de cada motor se instalan bajo demanda en `data/engines/site-packages` (botón «Instalar»). Embeddings de la memoria: siempre Ollama.
 
 **Flujo de un mensaje**
 1. Si hay imágenes, se guardan en `workspace/subidas` y el modelo de visión las describe.
@@ -64,6 +73,10 @@ studio.env.example  toda la configuración
 | `WHISPER_MODEL`, `WHISPER_LANGUAGE`, `WHISPER_BEAM`, `PIPER_VOICE` | small, (auto), 1, (auto en `voices/`) | Voz (GPU si hay CUDA; si faltan sus DLL pasa a CPU solo) |
 | `COMFYUI_URL` | | Generación de imágenes |
 | `ENABLE_CODE_EXEC`, `CODE_EXEC_TIMEOUT`, `MAX_AGENT_STEPS` | true, 30, 8 | Agentes |
+| `ENGINE`, `PLACEMENT`, `GPU_LAYERS` | auto, auto, 0 | Motor y ubicación por defecto (`gpu`, `cpu`, `mixed`, `npu`); cada modelo se ajusta en ⚙️ Modelos |
+| `MODELS_DIR`, `ENGINE_PACKS_DIR` | `data/models`, `data/engines` | Modelos que no son de Ollama y motores instalados aparte |
+| `LLAMA_SERVER`, `LLAMA_SERVER_URL`, `MLC_URL`, `TRTLLM_URL`, `GENIE_BIN` | | Motores externos (ejecutable o servidor ya en marcha) |
+| `MAX_NEW_TOKENS` | 2048 | Tokens máximos por respuesta fuera de Ollama |
 
 ### Optimizaciones de rendimiento (v1.2)
 
@@ -108,22 +121,26 @@ Descarga Python 3.12 oficial (NuGet), instala las ruedas `win_amd64` con uv, com
 
 **Android** (sin Android Studio):
 ```bash
-bash android/build_android.sh    # -> dist/StudioIA-Android.apk
+bash android/build_android.sh    # -> dist/StudioIA-Android.apk y dist/StudioIA-Android-Snapdragon.apk
 ```
-Descarga de Maven Central apktool (aapt2 + framework Android 16), dalvik-dx, apksig y la API de Android 14; compila recursos y Java, alinea y firma (APK Signature Scheme v2). La clave se crea en `android/release.p12` (contraseña `studioia`, cambiable con `KEYSTORE_PASS`). **Guárdala**: las actualizaciones deben firmarse con la misma clave.
+Descarga apktool (aapt2 + framework), D8 (R8), apksig y la API de Android 14, y los motores: ONNX Runtime GenAI (NuGet), ONNX Runtime, ExecuTorch con Vulkan, fbjni y GenieX (Maven Central) y LiteRT-LM (rueda de PyPI para Android, más el puente `android/jni/litertlm_jni.c` compilado con zig). Compila recursos y Java, dexa, firma (v1 + v2) y verifica. `VARIANTS=standard` compila solo la normal. La clave se crea en `android/release.p12` (contraseña `studioia`, cambiable con `KEYSTORE_PASS`). **Guárdala**: las actualizaciones deben firmarse con la misma clave.
 
 ### Modo autónomo de la app Android
 - `android/build_engine.sh` compila `llama-server` (llama.cpp) para arm64 como binario estático con zig (sin NDK) y lo deja en `android/jniLibs/arm64-v8a/libllama-server.so`. `build_android.sh` lo empaqueta si existe.
 - `LocalStudio.java` lanza el motor como proceso local (chat/visión en 127.0.0.1:8431, embeddings en :8432), sirve la interfaz desde los assets en `http://studio.local/` y expone el puente nativo (archivos, descargas, voz).
 - `android/assets/www/local.js` sustituye al backend: intercepta `fetch('/api/…')` e implementa en el móvil agentes (supervisor + ReAct con herramientas por texto `<tool>{…}</tool>`, válido para cualquier modelo), memoria vectorial con deduplicación y workspace.
-- Prueba sin dispositivo: `node android/tests/local_test.js` (Chromium con puente y motor simulados).
+- Motores dentro de la app (`Engines.java`): ONNX Runtime GenAI (CPU), ExecuTorch (CPU con XNNPACK o GPU con Vulkan, según se exportó el `.pte`), LiteRT-LM (CPU o GPU) y, solo en la APK Snapdragon, Qualcomm Genie mediante GenieX (`src-snapdragon/`: NPU Hexagon, GPU Adreno o CPU; carpetas de Qualcomm AI Hub o `.gguf`). llama.cpp sigue como proceso aparte (CPU). `local.js` elige motor y ubicación por modelo igual que el PC (formato → motores posibles → lo fijado, lo medido o la estimación) y aplica la plantilla Jinja del modelo con `jinja.js` (@huggingface/jinja, MIT). OpenVINO, MLC y TensorRT no tienen versión utilizable en Android y aparecen con ✕ y el motivo.
+- Prueba sin dispositivo: `node android/tests/local_test.js` (Chromium con puente y motores simulados).
 
 ## 7. API HTTP
 
 | Método y ruta | Uso |
 |---|---|
 | `GET /api/ping`, `GET /api/health` | Estado, modelos instalados/faltantes, capacidades |
-| `POST /api/models/pull` `{model}` | Descarga un modelo (progreso NDJSON) |
+| `POST /api/models/pull` `{model}` | Descarga un modelo (progreso NDJSON); `hf:org/repo` baja de Hugging Face |
+| `GET /api/engines`, `PUT /api/engines/settings` `{models: {ref: {engine, placement, gpu_layers}}, roles}` | Motores, hardware y dónde se ejecuta cada modelo |
+| `POST /api/engines/benchmark` `{model, max_tokens}`, `POST /api/engines/{id}/install` | Medir velocidad por motor y ubicación (NDJSON); instalar un motor |
+| `POST /api/models/download` `{repo, include}` | Descargar un modelo de Hugging Face a `MODELS_DIR` |
 | `POST /api/chat` `{message, images[], mode, conversation_id, auto_memory}` | Chat (SSE: `agent`, `tool_call`, `tool_result`, `memory`, `token`, `memory_saved`, `done`, `error`) |
 | `GET/POST/PATCH/DELETE /api/conversations[/{id}]` | Conversaciones |
 | `GET/PUT /api/agents`, `POST /api/agents/reset`, `GET /api/tools` | Equipo de agentes |

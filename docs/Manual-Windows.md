@@ -36,6 +36,18 @@ En la pestaña **⚙️ Modelos** verás tres perfiles. Pulsa **📋 config** en
 
 `MODEL_EMBED=qwen3-embedding:0.6b` (memoria, 0,6 GB, multilingüe) sirve para todos. En el perfil ligero un único modelo hace de chat, programador y visión: la memoria solo tiene que alojar uno.
 
+**Motores y dónde se carga cada modelo (v1.3)**
+
+En ⚙️ Modelos → **Motores** ves los motores de inferencia: ✓ disponible, ✕ no disponible (mantén el ratón encima para ver por qué). Algunos tienen un botón **Instalar** que los descarga una vez.
+
+En **Dónde se ejecuta cada modelo** puedes, para cada modelo:
+- **Motor**: automático (recomendado) o uno concreto. En automático el estudio usa el que mejor encaje con el formato del modelo y tu equipo.
+- **Ubicación**: automática, **GPU (VRAM)**, **CPU (RAM)**, **mixta** (eliges cuántas capas van a la GPU; el resto a la RAM) o **NPU** si tu equipo la tiene.
+- **⚡ Medir**: prueba todas las combinaciones posibles y, desde entonces, el automático usa la más rápida.
+- **Chat / Código / Visión**: qué modelo hace cada papel.
+
+Para añadir modelos de otros motores, escribe el repositorio de Hugging Face (por ejemplo `OpenVINO/Qwen3-8B-int4-ov` o `onnxruntime/...`) y pulsa **Descargar**, o copia la carpeta o el archivo en `data\models`.
+
 **Consejos de rendimiento**
 
 - Con GPU NVIDIA, actualiza el controlador: Ollama la usa automáticamente. En ⚙️ Modelos → «Cargados en memoria» ves qué parte de cada modelo va en la GPU. Si no está al 100 %, el modelo no cabe: baja de perfil o pon `NUM_CTX=4096`.

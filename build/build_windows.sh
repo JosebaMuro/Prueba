@@ -13,7 +13,8 @@ mkdir -p "$CACHE"
   "https://api.nuget.org/v3-flatcontainer/python/$PYVER/python.$PYVER.nupkg"
 TMP=$(mktemp -d); unzip -q "$CACHE/python.nupkg" 'tools/*' -d "$TMP"
 cp -r "$TMP/tools/." "$OUT/runtime/"; rm -rf "$TMP"
-rm -rf "$OUT/runtime/Lib/site-packages/pip"* "$OUT/runtime/Lib/test" "$OUT/runtime/Lib/idlelib" "$OUT/runtime/Lib/tkinter" "$OUT/runtime/tcl" 2>/dev/null || true
+# pip se queda: el botón «Instalar» de los motores lo usa (pip --target data/engines)
+rm -rf "$OUT/runtime/Lib/test" "$OUT/runtime/Lib/idlelib" "$OUT/runtime/Lib/tkinter" "$OUT/runtime/tcl" 2>/dev/null || true
 
 echo "== 2/4 Dependencias (ruedas win_amd64)"
 uv pip install --quiet --target "$OUT/runtime/Lib/site-packages" \

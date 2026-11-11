@@ -19,7 +19,13 @@ En ambos modos tus datos se quedan en tus dispositivos.
 - **Modo conectado:** el PC con Studio IA Local encendido, con `LAN=true` en `studio.env` (ver *Manual de Windows*, apartado 5), y móvil y PC en la misma Wi-Fi.
 
 ## 2. Instalar la app
-1. Copia `StudioIA-Android.apk` al móvil (cable USB, Google Drive, correo…) o descárgalo directamente en él.
+Hay dos APK; instala **solo una**:
+- `StudioIA-Android-Snapdragon.apk` si tu móvil tiene procesador **Qualcomm Snapdragon**: añade Qualcomm Genie, que usa la **NPU Hexagon** y la GPU Adreno (unos 85 MB más).
+- `StudioIA-Android.apk` para el resto (MediaTek, Exynos, Tensor…).
+
+Las dos se actualizan entre sí sin perder datos.
+
+1. Copia la APK al móvil (cable USB, Google Drive, correo…) o descárgalo directamente en él.
 2. Ábrelo desde la app *Archivos* o *Descargas*.
 3. Android pedirá permiso para **instalar aplicaciones desconocidas** desde esa app: actívalo y vuelve atrás.
 4. Pulsa **Instalar**. Si Play Protect avisa de que no conoce la app, pulsa **Instalar de todas formas**. Aparece porque la app no se distribuye por Google Play.
@@ -40,6 +46,8 @@ Qué incluye el modo autónomo:
 - **Visión** con el perfil Gemma 3: adjunta o haz una foto con 📎.
 - **Voz**: 🎙️ usa el dictado de Android y 🔊 su síntesis de voz. Para que funcionen sin conexión, descarga el español en *Ajustes → Sistema → Idiomas → Reconocimiento de voz sin conexión*.
 - **Otros modelos**: pega la URL de cualquier archivo `.gguf` en «Descargar modelo».
+- **Otros motores (v1.3)**: además de llama.cpp, la app trae **ONNX Runtime GenAI** (CPU), **ExecuTorch** (CPU o GPU con Vulkan), **LiteRT-LM** de Google (CPU o GPU) y, en la APK Snapdragon, **Qualcomm Genie** (NPU, GPU o CPU). En ⚙️ Modelos → **Dónde se ejecuta cada modelo** eliges motor y ubicación (CPU, GPU o NPU) o lo dejas en automático; **⚡ Medir** prueba todas las combinaciones y el automático se queda con la más rápida. Pulsa **Chat** en un modelo para usarlo. Para descargarlos, escribe el repositorio de Hugging Face (`org/repo`, o `org/repo/carpeta` para una subcarpeta). Se baja todo lo que contiene, así que elige uno con un solo modelo o la subcarpeta del que quieras. OpenVINO, MLC y TensorRT no existen para móviles y aparecen tachados.
+- En el móvil la **GPU y la NPU comparten la RAM** del teléfono: no hay VRAM aparte, así que elegir GPU o NPU cambia la velocidad y el consumo, no cuánto modelo cabe. La visión solo funciona con llama.cpp.
 
 Consejos:
 - La primera respuesta tarda más porque el modelo se carga en memoria. Cierra otras apps para dejarle RAM.
