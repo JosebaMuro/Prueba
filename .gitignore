@@ -218,3 +218,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Studio IA Local ---
+# El script de compilación de Windows sí se versiona (la regla build/ de arriba es de Python)
+!/build/
+/build/.cache/
+dist/
+data/
+workspace/
+android/build/
+android/.tools/
+# Claves de firma: nunca al repositorio
+*.p12
+*.jks
+*.keystore
+launcher/rsrc_windows_amd64.syso
+studio.env
+# Binarios pesados: se publican como adjuntos de la Release
+android/jniLibs/
