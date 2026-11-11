@@ -14,9 +14,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import agents, config, llm, memory, multimodal, workspace
+from . import agents, config, engines, llm, memory, multimodal, workspace
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Modelos recomendados por perfil de hardware (todos en la librería de Ollama, comprobados en nov. 2026).
 # Menos modelos distintos = menos cambios de modelo en la GPU = respuestas mucho más rápidas.
@@ -36,10 +36,12 @@ RECOMMENDED = {
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     memory.init_db()
+    engines.apply_roles()
     warm = asyncio.create_task(llm.warmup()) if config.WARMUP else None
     yield
     if warm and not warm.done():
         warm.cancel()
+    await engines.unload_all()
 
 
 app = FastAPI(title="Studio IA Local", version=VERSION, lifespan=lifespan)
@@ -75,6 +77,8 @@ async def health():
     needed = {config.MODEL_CHAT, config.MODEL_CODE, config.MODEL_VISION, config.MODEL_EMBED}
 
     def installed(m: str) -> bool:
+        if engines.formats.resolve_path(m):
+            return True  # modelo local (ONNX, OpenVINO, GGUF, .pte…)
         return any(x == m or x == f"{m}:latest" for x in models)
 
     return {
@@ -107,7 +111,10 @@ class PullReq(BaseModel):
 
 @app.post("/api/models/pull")
 async def pull_model(req: PullReq):
-    """Descarga un modelo en Ollama y transmite el progreso (NDJSON)."""
+    """Descarga un modelo en Ollama y transmite el progreso (NDJSON). Con "hf:org/repo" lo baja de Hugging Face."""
+    if req.model.startswith("hf:"):
+        return StreamingResponse(engines.download(req.model[3:]), media_type="application/x-ndjson")
+
     async def gen():
         async with httpx.AsyncClient(timeout=None) as c:
             async with c.stream("POST", f"{config.OLLAMA_URL}/api/pull", json={"model": req.model}) as r:
@@ -115,6 +122,52 @@ async def pull_model(req: PullReq):
                     if line:
                         yield line + "\n"
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+# ------------------------------------------------------------------ motores de inferencia
+
+@app.get("/api/engines")
+async def engines_status():
+    """Hardware detectado, motores (disponibles o con el motivo) y, por modelo, motor y ubicación elegidos."""
+    return await engines.status()
+
+
+@app.put("/api/engines/settings")
+async def engines_settings(body: dict):
+    """{"models": {ref: {"engine", "placement", "gpu_layers"}}, "roles": {"chat": ref, ...}}"""
+    engines.update(body)
+    await engines.unload_all()  # se recargan con la nueva ubicación en el próximo mensaje
+    return await engines.status()
+
+
+@app.post("/api/engines/{engine_id}/install")
+async def engines_install(engine_id: str):
+    return StreamingResponse(engines.install(engine_id), media_type="application/x-ndjson")
+
+
+class BenchReq(BaseModel):
+    model: str
+    max_tokens: int = 96
+
+
+@app.post("/api/engines/benchmark")
+async def engines_benchmark(req: BenchReq):
+    """Mide tokens/s de cada motor + ubicación posibles para el modelo (NDJSON con el progreso)."""
+    async def gen():
+        async for ev in engines.benchmark(req.model, req.max_tokens):
+            yield json.dumps(ev, ensure_ascii=False) + "\n"
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+class DownloadReq(BaseModel):
+    repo: str
+    include: list[str] = []
+
+
+@app.post("/api/models/download")
+async def download_model(req: DownloadReq):
+    """Descarga un modelo de Hugging Face (ONNX, OpenVINO, GGUF, MLC, .litertlm…) a la carpeta de modelos."""
+    return StreamingResponse(engines.download(req.repo, req.include or None), media_type="application/x-ndjson")
 
 
 # ------------------------------------------------------------------ conversaciones y chat

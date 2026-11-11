@@ -1,88 +1,42 @@
-"""Cliente para la API nativa de Ollama: chat (con herramientas y streaming), visión y embeddings.
+"""Puerta única a los modelos: chat (con herramientas y streaming), visión y embeddings.
 
-Optimizaciones:
-- Mismas opciones (num_ctx, keep_alive) en todas las llamadas: Ollama nunca recarga el modelo
-  por un cambio de contexto y lo mantiene en memoria entre mensajes.
-- Capacidades de cada modelo (tools / thinking / vision) consultadas una vez a /api/show y
-  cacheadas: no se envía `think` ni `tools` a modelos que no los admiten (evita errores 400).
-- Respuestas en streaming con herramientas: el texto llega a la interfaz según se genera.
-- Embeddings con el prefijo que cada modelo espera para consultas y documentos, y caché LRU.
-- Rescate de llamadas a herramientas que algunos modelos escriben como texto en vez de tool_calls.
+El chat lo atiende el motor que elija engines.resolve() para cada modelo: Ollama para los nombres de su
+librería (qwen3:8b) y llama-server, ONNX Runtime GenAI, OpenVINO GenAI, LiteRT-LM, ExecuTorch, MLC LLM,
+TensorRT-LLM o Qualcomm Genie para modelos locales en sus formatos (ver engines/).
+Los embeddings de la memoria siguen en Ollama (con prefijos por familia de modelo y caché LRU).
 """
 from __future__ import annotations
 
-import json
-import re
 import uuid
 from collections import OrderedDict
 from typing import Any, AsyncIterator
 
 import httpx
 
-from . import config
+from . import config, engines
+from .engines import ollama as _ollama
 
-_client = httpx.AsyncClient(base_url=config.OLLAMA_URL, timeout=httpx.Timeout(900, connect=10))
-_caps: dict[str, set[str]] = {}
+_client = _ollama.client()
 
 
 async def capabilities(model: str) -> set[str]:
-    """Capacidades declaradas por Ollama para el modelo (vacío si no se pueden consultar)."""
-    if model not in _caps:
-        try:
-            r = await _client.post("/api/show", json={"model": model})
-            r.raise_for_status()
-            caps = set(r.json().get("capabilities") or [])
-            _caps[model] = caps or {"completion", "tools"}  # Ollama antiguo: no informa, asumimos tools
-        except (httpx.HTTPError, ValueError):
-            return {"completion", "tools"}  # sin cachear: se reintenta en la próxima llamada
-    return _caps[model]
-
-
-def _options(extra: dict | None) -> dict:
-    opts = {"num_ctx": config.NUM_CTX, "temperature": config.TEMPERATURE}
-    opts.update(extra or {})
-    return opts
-
-
-async def _payload(model: str, messages: list[dict], tools: list[dict] | None, options: dict | None,
-                   stream: bool, fmt: Any = None) -> dict:
-    caps = await capabilities(model)
-    payload: dict[str, Any] = {"model": model, "messages": messages, "stream": stream,
-                               "keep_alive": config.KEEP_ALIVE, "options": _options(options)}
-    if tools and "tools" in caps:
-        payload["tools"] = tools
-    if "thinking" in caps:
-        # gpt-oss no se puede desactivar: se le pide el nivel mínimo
-        payload["think"] = ("medium" if config.THINK else "low") if model.startswith("gpt-oss") else config.THINK
-    if fmt is not None:
-        payload["format"] = fmt
-    return payload
-
-
-_TOOL_TAG = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
+    """Capacidades del modelo (tools / thinking / vision). Para Ollama se consultan; para el resto, por formato."""
+    try:
+        engine, spec = await engines.resolve(model)
+    except engines.EngineUnavailable:
+        return {"completion", "tools"}
+    if engine.id == "ollama":
+        return await _ollama.capabilities(model)
+    caps = engines.capabilities_sync(model)
+    return caps if engine.id == "llamacpp" else caps - {"vision"}
 
 
 def rescue_tool_calls(msg: dict, tools: list[dict] | None) -> dict:
     """Si el modelo escribió la llamada a herramienta como texto, la convierte en tool_calls."""
     if msg.get("tool_calls") or not tools:
         return msg
-    content = (msg.get("content") or "").strip()
-    names = {t["function"]["name"] for t in tools}
-    candidates = _TOOL_TAG.findall(content)
-    if not candidates:
-        bare = content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        if bare.startswith("{") and bare.endswith("}"):
-            candidates = [bare]
-    calls = []
-    for c in candidates:
-        try:
-            j = json.loads(c)
-        except ValueError:
-            continue
-        name = j.get("name") or (j.get("function") or {}).get("name")
-        args = j.get("arguments", j.get("parameters", j.get("args", {})))
-        if name in names:
-            calls.append({"function": {"name": name, "arguments": args if isinstance(args, dict) else {}}})
+    from .engines.base import parse_tool_calls
+    _rest, calls = parse_tool_calls((msg.get("content") or "").strip(), tools)
     if calls:
         msg = {**msg, "content": "", "tool_calls": calls}
     return msg
@@ -91,41 +45,34 @@ def rescue_tool_calls(msg: dict, tools: list[dict] | None) -> dict:
 async def chat(model: str, messages: list[dict], tools: list[dict] | None = None,
                options: dict | None = None, fmt: Any = None) -> dict:
     """Llamada no streaming. Devuelve el mensaje del asistente (puede traer tool_calls)."""
-    r = await _client.post("/api/chat", json=await _payload(model, messages, tools, options, False, fmt))
-    r.raise_for_status()
-    msg = r.json()["message"]
-    msg.pop("thinking", None)
+    engine, spec = await engines.resolve(model)
+    if engine.id == "ollama":
+        return rescue_tool_calls(await engine.chat(spec, messages, tools, options, fmt), tools)
+    msg: dict = {}
+    async for kind, val in engine.chat_events(spec, messages, tools, options):
+        if kind == "message":
+            msg = val
+    if fmt is not None and not msg.get("tool_calls"):
+        msg["content"] = _json_only(msg.get("content", ""))
     return rescue_tool_calls(msg, tools)
+
+
+def _json_only(text: str) -> str:
+    """Motores sin salida JSON forzada: se recorta el primer objeto/lista JSON del texto."""
+    for a, b in (("{", "}"), ("[", "]")):
+        i, j = text.find(a), text.rfind(b)
+        if 0 <= i < j:
+            return text[i:j + 1]
+    return text
 
 
 async def chat_events(model: str, messages: list[dict], tools: list[dict] | None = None,
                       options: dict | None = None) -> AsyncIterator[tuple[str, Any]]:
-    """Streaming con herramientas. Emite ("text", trozo) según se genera y al final ("message", msg)."""
-    content, calls = [], []
-    async with _client.stream("POST", "/api/chat",
-                              json=await _payload(model, messages, tools, options, True)) as r:
-        if r.status_code >= 400:
-            await r.aread()
-            r.raise_for_status()
-        async for line in r.aiter_lines():
-            if not line:
-                continue
-            chunk = json.loads(line)
-            if chunk.get("error"):
-                raise RuntimeError(chunk["error"])
-            m = chunk.get("message") or {}
-            if m.get("tool_calls"):
-                calls.extend(m["tool_calls"])
-            piece = m.get("content") or ""
-            if piece:
-                content.append(piece)
-                yield "text", piece
-            if chunk.get("done"):
-                break
-    msg = {"role": "assistant", "content": "".join(content)}
-    if calls:
-        msg["tool_calls"] = calls
-    yield "message", rescue_tool_calls(msg, tools)
+    """Streaming con herramientas. Emite ("text", trozo) según se genera y al final ("message", msg).
+    El motor (Ollama, llama-server, ONNX Runtime GenAI, OpenVINO…) lo elige engines.resolve()."""
+    engine, spec = await engines.resolve(model)
+    async for kind, val in engine.chat_events(spec, messages, tools, options):
+        yield kind, (rescue_tool_calls(val, tools) if kind == "message" else val)
 
 
 async def chat_stream(model: str, messages: list[dict], options: dict | None = None) -> AsyncIterator[str]:
@@ -203,8 +150,10 @@ async def running_models() -> list[dict]:
 async def warmup() -> None:
     """Carga el modelo de chat y el de embeddings en segundo plano para que el primer mensaje sea rápido."""
     try:
-        await _client.post("/api/chat", json={"model": config.MODEL_CHAT, "messages": [],
-                                              "keep_alive": config.KEEP_ALIVE, "options": _options(None)})
+        engine, _spec = await engines.resolve(config.MODEL_CHAT)
+        if engine.id == "ollama":
+            await _client.post("/api/chat", json={"model": config.MODEL_CHAT, "messages": [],
+                                                  "keep_alive": config.KEEP_ALIVE, "options": _ollama.options(None)})
         await embed([f"warmup {uuid.uuid4().hex[:4]}"])
     except Exception:
         pass

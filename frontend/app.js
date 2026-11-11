@@ -43,7 +43,7 @@ $("#panelClose").addEventListener("click", () => toggle("panel", false));
 $$(".tabs button[data-tab]").forEach((b) => b.addEventListener("click", () => {
   $$(".tabs button[data-tab]").forEach((x) => x.classList.toggle("active", x === b));
   $$(".tab").forEach((t) => (t.hidden = t.id !== "tab-" + b.dataset.tab));
-  ({ ws: loadWorkspace, mem: loadMemory, agents: loadAgents, models: loadHealth })[b.dataset.tab]();
+  ({ ws: loadWorkspace, mem: loadMemory, agents: loadAgents, models: () => { loadHealth(); loadEngines(); } })[b.dataset.tab]();
 }));
 
 // ---------------------------------------------------------------- conversaciones
@@ -387,6 +387,105 @@ async function pull(model) {
   }
   label.textContent = `${model}: ✓ listo`; bar.value = 100;
 }
+// ---------------------------------------------------------------- motores de inferencia
+// Lista de motores (✓ disponible / ✕ con el motivo), hardware detectado y, para cada modelo, qué motor lo
+// ejecuta y dónde se carga: VRAM (GPU), RAM (CPU), mixto o NPU. Todo se guarda al momento.
+async function loadEngines() {
+  const box = $("#engines"); if (!box) return;
+  const st = await api("/api/engines").catch((e) => ({ error: e.message }));
+  box.innerHTML = "";
+  if (st.error) { box.append(el("p", { class: "hint" }, "Motores: " + st.error)); return; }
+  const hw = st.hardware;
+  box.append(el("h3", {}, "Motores"));
+  const list = el("div", { class: "engines" });
+  for (const e of st.engines) {
+    const chip = el("span", { class: "eng " + (e.available ? "ok" : "off"), title: e.available ? `${e.name}: disponible` : `${e.name}: ${e.reason}` },
+      (e.available ? "✓ " : "✕ ") + e.name);
+    if (e.installable) chip.append(el("button", { class: "small", title: "Descargar e instalar este motor (una vez, necesita Internet)", onclick: () => installEngine(e) }, "Instalar"));
+    list.append(chip);
+  }
+  box.append(list);
+  const gpus = (hw.gpus || []).map((g) => g.name + (g.vram_gb ? ` (${g.vram_gb} GB)` : "")).join(", ");
+  box.append(el("p", { class: "hint" }, `Equipo: ${hw.cpu} · ${hw.ram_gb} GB de RAM` + (gpus ? ` · GPU: ${gpus}` : " · sin GPU") +
+    (hw.npus?.length ? ` · NPU: ${hw.npus.map((n) => n.name).join(", ")}` : "")));
+  box.append(el("p", { class: "hint" }, "Pasa el ratón (o mantén pulsado) sobre un motor con ✕ para ver por qué no está disponible."));
+
+  box.append(el("h3", {}, "Dónde se ejecuta cada modelo"));
+  for (const m of st.models) box.append(modelRow(m, st));
+
+  const form = el("form", { class: "row", style: "flex-wrap:wrap;margin-top:8px" },
+    el("input", { id: "hfRepo", placeholder: "Hugging Face: p. ej. OpenVINO/Qwen3-8B-int4-ov", style: "flex:1;min-width:220px" }),
+    el("button", { class: "small primary" }, "⬇ Descargar"));
+  form.onsubmit = (ev) => { ev.preventDefault(); const r = $("#hfRepo").value.trim(); if (r) streamJob("/api/models/download", { repo: r }, r).then(loadEngines); };
+  box.append(el("h3", {}, "Añadir un modelo para otros motores"), form,
+    el("p", { class: "hint" }, `Formatos: carpeta ONNX GenAI, OpenVINO IR, MLC, TensorRT-LLM o Genie; archivos .gguf, .pte o .litertlm. También puedes copiarlos a mano en ${st.models_dir}.`),
+    el("div", { id: "engineJobs" }));
+}
+function modelRow(m, st) {
+  const opts = m.options || [];
+  const engSel = el("select", { title: "Motor" }, el("option", { value: "auto" }, "Motor: automático"),
+    ...opts.map((o) => el("option", { value: o.engine }, o.name)));
+  engSel.value = opts.some((o) => o.engine === m.setting.engine) ? m.setting.engine : "auto";
+  const allowed = () => { const o = opts.find((x) => x.engine === engSel.value); return o ? o.placements : [...new Set(opts.flatMap((x) => x.placements))]; };
+  const plSel = el("select", { title: "Dónde se carga el modelo" });
+  const layers = el("input", { type: "number", min: 0, max: 999, value: m.setting.gpu_layers || 0, title: "Capas en la GPU (el resto va a la RAM)", style: "width:80px" });
+  const fillPl = () => {
+    const cur = plSel.value || m.setting.placement; plSel.innerHTML = "";
+    plSel.append(el("option", { value: "auto" }, "Ubicación: automática"), ...allowed().map((p) => el("option", { value: p }, st.placements[p] || p)));
+    plSel.value = [...plSel.options].some((o) => o.value === cur) ? cur : "auto";
+    layers.hidden = plSel.value !== "mixed";
+  };
+  fillPl();
+  const save = async () => {
+    layers.hidden = plSel.value !== "mixed";
+    await api("/api/engines/settings", { method: "PUT", json: { models: { [m.ref]: { engine: engSel.value, placement: plSel.value, gpu_layers: +layers.value || 0 } } } }).catch((e) => toast(e.message));
+    loadEngines();
+  };
+  engSel.onchange = () => { fillPl(); save(); }; plSel.onchange = save; layers.onchange = save;
+  const c = m.chosen;
+  const using = c.error ? el("span", { class: "hint", style: "color:var(--danger)" }, c.error)
+    : el("span", { class: "hint" }, `→ ${c.engine_name} · ${c.placement === "auto" ? "reparto automático RAM/VRAM" : st.placements[c.placement] || c.placement}`);
+  const bench = Object.entries(m.bench || {}).filter(([, r]) => r.tps).sort((a, b) => b[1].tps - a[1].tps)
+    .map(([k, r]) => { const [e, p] = k.split("|"); const n = st.engines.find((x) => x.id === e)?.name || e; return `${n} · ${st.placements[p] || p}: ${r.tps} tok/s`; });
+  const roleBtns = [["chat", "Chat"], ["code", "Código"], ["vision", "Visión"]].map(([r, label]) =>
+    el("button", { class: "small" + (m.roles.includes(r) ? " primary" : ""), title: `Usar este modelo para ${label.toLowerCase()}`,
+      onclick: async () => { await api("/api/engines/settings", { method: "PUT", json: { roles: { [r]: m.ref } } }); loadEngines(); loadHealth(); } }, label));
+  return el("div", { class: "model-row" },
+    el("div", { class: "row", style: "flex-wrap:wrap" }, el("strong", {}, m.ref), el("span", { class: "badge" }, m.format_label + (m.size_gb ? ` · ${m.size_gb} GB` : ""))),
+    el("div", { class: "row", style: "flex-wrap:wrap;margin-top:4px" }, engSel, plSel, layers,
+      el("button", { class: "small", title: "Prueba la velocidad con cada motor y ubicación posibles; el automático elegirá el más rápido", onclick: () => benchmark(m.ref) }, "⚡ Medir")),
+    el("div", { class: "row", style: "flex-wrap:wrap;margin-top:4px" }, using, el("span", { class: "grow" }), ...roleBtns),
+    ...(bench.length ? [el("div", { class: "hint" }, "Medido: " + bench.join(" · "))] : []));
+}
+async function streamJob(path, body, label, onEvent) {
+  const box = $("#engineJobs") || $("#pullProgress"); const line = el("div", { class: "hint" }, `${label}: iniciando…`); box.append(line);
+  try {
+    const r = await api(path, { json: body, raw: true });
+    const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true }); const lines = buf.split("\n"); buf = lines.pop();
+      for (const l of lines) { if (!l.trim()) continue; const ev = JSON.parse(l);
+        if (onEvent) onEvent(ev, line);
+        else if (ev.error) line.textContent = `${label}: ⚠️ ${ev.error}`;
+        else line.textContent = `${label}: ${ev.done ? "✓ listo" : ev.status}`; }
+    }
+  } catch (e) { line.textContent = `${label}: ⚠️ ${e.message}`; }
+}
+async function installEngine(e) {
+  if (!confirm(`¿Descargar e instalar ${e.name}? Necesita Internet una vez y puede ocupar varios cientos de MB.`)) return;
+  await streamJob(`/api/engines/${e.id}/install`, {}, e.name); loadEngines();
+}
+async function benchmark(ref) {
+  await streamJob("/api/engines/benchmark", { model: ref }, `⚡ ${ref}`, (ev, line) => {
+    if (ev.status === "running") line.textContent = `⚡ ${ref}: probando ${ev.label}…`;
+    else if (ev.status === "result") line.after(el("div", { class: "hint" }, `   ${ev.label}: ${ev.error ? "⚠️ " + ev.error : ev.tps + " tok/s (primer token en " + ev.ttft + " s)"}`));
+    else if (ev.status === "done") line.textContent = `⚡ ${ref}: terminado` + (ev.best ? " · el automático usará el más rápido" : "");
+    else if (ev.error) line.textContent = `⚡ ${ref}: ⚠️ ${ev.error}`;
+  });
+  loadEngines();
+}
+
 $("#pullForm").onsubmit = (e) => { e.preventDefault(); const m = $("#pullName").value.trim(); if (m) pullMany([m]); };
 
 // ---------------------------------------------------------------- arranque
