@@ -1,3 +1,0 @@
-00b700b34ee8200bf85d18a11efe4a7460359c1923af450e0512992c6aacb9ae  StudioIA-Android.apk
-c8c26139dd513023f1cdafa5479c74cdf3a29e40d334547d359112030d8eaad0  StudioIA-Android-Snapdragon.apk
-4eb57e26bde95c9cef81ae355c65845c944b06e5d141c549df40a4455e53fd95  StudioIA-Windows-x64.zip
