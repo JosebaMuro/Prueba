@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Studio IA Local</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar" class="drawer">
+    <div class="brand"><img src="icon.svg" alt=""><span>Studio IA</span></div>
+    <button id="newChat" class="primary wide">＋ Nueva conversación</button>
+    <nav id="convList"></nav>
+    <div class="sidebar-foot">
+      <span id="statusDot" class="dot"></span><span id="statusText">Conectando…</span>
+    </div>
+  </aside>
+
+  <main id="chat">
+    <header class="topbar">
+      <button class="icon only-mobile" data-toggle="sidebar" title="Conversaciones">☰</button>
+      <select id="mode" title="Quién responde">
+        <option value="auto">🧭 Equipo (supervisor)</option>
+      </select>
+      <label class="chk" title="Leer las respuestas en voz alta"><input type="checkbox" id="speak"> 🔊</label>
+      <label class="chk" title="Guardar automáticamente hechos importantes en la memoria"><input type="checkbox" id="autoMem" checked> 🧠</label>
+      <span class="grow"></span>
+      <button class="icon" data-toggle="panel" title="Workspace, memoria, agentes y modelos">▤</button>
+    </header>
+
+    <section id="messages">
+      <div class="welcome" id="welcome">
+        <img src="icon.svg" alt="">
+        <h1>Studio IA Local</h1>
+        <p>Un equipo de agentes de IA que trabaja en tu ordenador, con memoria y un workspace de archivos. Nada sale de tu máquina.</p>
+        <div class="chips">
+          <button class="chip">Analiza el CSV que he subido y hazme un gráfico</button>
+          <button class="chip">Escribe un informe en Markdown sobre los documentos del workspace</button>
+          <button class="chip">¿Qué recuerdas de mí?</button>
+          <button class="chip">Genera una ilustración de un faro al atardecer</button>
+        </div>
+      </div>
+    </section>
+
+    <form id="composer">
+      <div id="attachments"></div>
+      <div class="row">
+        <button type="button" class="icon" id="attachBtn" title="Adjuntar imagen o archivo">📎</button>
+        <input type="file" id="fileInput" accept="image/*,.pdf,.txt,.md,.csv,.json,.docx,.py" multiple hidden>
+        <textarea id="input" rows="1" placeholder="Escribe un mensaje…"></textarea>
+        <button type="button" class="icon" id="micBtn" title="Dictar">🎙️</button>
+        <button type="submit" class="primary" id="sendBtn">Enviar</button>
+      </div>
+    </form>
+  </main>
+
+  <aside id="panel" class="drawer right">
+    <div class="tabs">
+      <button data-tab="ws" class="active">📁 Workspace</button>
+      <button data-tab="mem">🧠 Memoria</button>
+      <button data-tab="agents">🤖 Agentes</button>
+      <button data-tab="models">⚙️ Modelos</button>
+      <span class="grow"></span>
+      <button class="only-drawer" id="panelClose" title="Cerrar">✕</button>
+    </div>
+
+    <div class="tab" id="tab-ws">
+      <div class="row">
+        <button id="wsUpload" class="small">⬆ Subir</button>
+        <button id="wsNew" class="small">＋ Nuevo</button>
+        <button id="wsReindex" class="small" title="Volver a indexar todos los documentos para la búsqueda">↻ Indexar</button>
+        <input type="file" id="wsFile" multiple hidden>
+      </div>
+      <ul id="wsTree" class="list"></ul>
+      <div id="wsEditor" hidden>
+        <div class="row"><strong id="wsPath"></strong><span class="grow"></span>
+          <button id="wsSave" class="small primary">Guardar</button>
+          <button id="wsDelete" class="small danger">Borrar</button>
+          <button id="wsClose" class="small">✕</button></div>
+        <textarea id="wsContent" spellcheck="false"></textarea>
+        <img id="wsImage" alt="" hidden>
+      </div>
+    </div>
+
+    <div class="tab" id="tab-mem" hidden>
+      <form id="memForm" class="row"><input id="memText" placeholder="Añadir un recuerdo…"><button class="small primary">Guardar</button></form>
+      <input id="memSearch" placeholder="Buscar en la memoria…">
+      <ul id="memList" class="list"></ul>
+    </div>
+
+    <div class="tab" id="tab-agents" hidden>
+      <p class="hint">Edita el equipo. El supervisor delega en estos agentes según su descripción.</p>
+      <div id="agentList"></div>
+      <div class="row">
+        <button id="agentAdd" class="small">＋ Agente</button>
+        <span class="grow"></span>
+        <button id="agentReset" class="small">Restaurar</button>
+        <button id="agentSave" class="small primary">Guardar equipo</button>
+      </div>
+    </div>
+
+    <div class="tab" id="tab-models" hidden>
+      <div id="health"></div>
+      <h3>Descargar modelo</h3>
+      <form id="pullForm" class="row"><input id="pullName" placeholder="p. ej. qwen3:8b"><button class="small primary">Descargar</button></form>
+      <div id="pullProgress"></div>
+      <div id="recommended"></div>
+    </div>
+  </aside>
+  <div id="scrim"></div>
+</div>
+<script src="markdown.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
