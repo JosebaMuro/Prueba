@@ -49,6 +49,20 @@ MAX_AGENT_STEPS = int(_env("MAX_AGENT_STEPS", "8"))
 TOOL_RESULT_CHARS = int(_env("TOOL_RESULT_CHARS", "8000"))  # lo que ve el modelo de cada resultado
 WARMUP = _bool("WARMUP", True)                         # precargar el modelo de chat al arrancar
 
+# Motores de inferencia (ver engines/). ENGINE=auto elige el mejor según el formato del modelo,
+# el hardware y las pruebas de velocidad; PLACEMENT=auto decide entre VRAM (GPU), RAM (CPU) o NPU.
+ENGINE = _env("ENGINE", "auto")
+PLACEMENT = _env("PLACEMENT", "auto")            # auto | gpu | cpu | mixed | npu
+GPU_LAYERS = int(_env("GPU_LAYERS", "0") or 0)   # capas en la GPU con PLACEMENT=mixed (llama.cpp/Ollama)
+MODELS_DIR = Path(_env("MODELS_DIR", str(DATA_DIR / "models"))).resolve()   # modelos que no son de Ollama
+ENGINE_PACKS_DIR = Path(_env("ENGINE_PACKS_DIR", str(DATA_DIR / "engines"))).resolve()  # motores instalados aparte
+LLAMA_SERVER = _env("LLAMA_SERVER", "")          # ruta a llama-server(.exe) para modelos .gguf sueltos
+LLAMA_SERVER_URL = _env("LLAMA_SERVER_URL", "")  # o un llama-server ya en marcha (http://host:puerto)
+MLC_URL = _env("MLC_URL", "")                    # servidor "mlc_llm serve" ya en marcha
+TRTLLM_URL = _env("TRTLLM_URL", "")              # servidor "trtllm-serve" (Linux/WSL con GPU NVIDIA)
+GENIE_BIN = _env("GENIE_BIN", "")                # carpeta del SDK QAIRT con genie-t2t-run (Snapdragon)
+MAX_NEW_TOKENS = int(_env("MAX_NEW_TOKENS", "2048"))
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 

@@ -61,6 +61,7 @@ public class LocalStudio {
     private SpeechRecognizer recognizer;
     private TextToSpeech tts;
     private boolean ttsReady = false;
+    private final Engines engines;
 
     LocalStudio(Activity act, WebView web) {
         this.act = act;
@@ -72,6 +73,7 @@ public class LocalStudio {
         kv = new File(act.getFilesDir(), "data");
         models.mkdirs();
         workspace.mkdirs();
+        engines = new Engines(act);
         kv.mkdirs();
     }
 
@@ -134,6 +136,28 @@ public class LocalStudio {
             throw new SecurityException("Ruta fuera del workspace: " + rel);
         }
         return f;
+    }
+
+    /** Archivo dentro de la carpeta de modelos (admite subcarpetas: org--modelo/archivo). */
+    private File modelPath(String rel) throws Exception {
+        File f = new File(models, rel).getCanonicalFile();
+        String base = models.getCanonicalPath();
+        if (!f.getPath().startsWith(base + File.separator)) throw new SecurityException("Ruta fuera de models: " + rel);
+        return f;
+    }
+
+    private static long sizeOf(File f) {
+        if (f.isFile()) return f.length();
+        long t = 0;
+        File[] fs = f.listFiles();
+        if (fs != null) for (File x : fs) t += sizeOf(x);
+        return t;
+    }
+
+    private static void deleteTree(File f) {
+        File[] fs = f.listFiles();
+        if (fs != null) for (File x : fs) deleteTree(x);
+        f.delete();
     }
 
     /** Envía un evento a local.js: window.__native(id, tipo, datos). */
@@ -212,6 +236,7 @@ public class LocalStudio {
 
     void destroy() {
         stopEngine();
+        engines.unload();
         if (recognizer != null) recognizer.destroy();
         if (tts != null) tts.shutdown();
     }
@@ -328,7 +353,116 @@ public class LocalStudio {
 
         @JavascriptInterface
         public void deleteModel(String file) {
-            new File(models, new File(file).getName()).delete();
+            try {
+                deleteTree(modelPath(file));
+            } catch (Exception ignored) {
+            }
+        }
+
+        /** Modelos de la carpeta models: [{name, dir, size, files: [nombres de primer nivel]}]. */
+        @JavascriptInterface
+        public String modelList() {
+            JSONArray out = new JSONArray();
+            try {
+                File[] fs = models.listFiles();
+                if (fs != null) for (File f : fs) {
+                    if (f.getName().endsWith(".part") || f.getName().startsWith(".")) continue;
+                    JSONObject o = new JSONObject();
+                    o.put("name", f.getName());
+                    o.put("dir", f.isDirectory());
+                    o.put("size", sizeOf(f));
+                    JSONArray files = new JSONArray();
+                    File[] inner = f.isDirectory() ? f.listFiles() : null;
+                    if (inner != null) for (File x : inner) if (!x.getName().endsWith(".part")) files.put(x.getName());
+                    o.put("files", files);
+                    out.put(o);
+                }
+            } catch (Exception ignored) {
+            }
+            return out.toString();
+        }
+
+        /** Lee un archivo de texto de la carpeta de modelos (plantillas, configuración). Máx. 4 MB. */
+        @JavascriptInterface
+        public String modelRead(String rel) {
+            try {
+                File f = modelPath(rel);
+                if (f.length() > 4 << 20) return "";
+                return new String(readAll(new FileInputStream(f)), "UTF-8");
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        @JavascriptInterface
+        public String modelAbsPath(String rel) {
+            try {
+                return modelPath(rel).getAbsolutePath();
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        // ---- motores dentro de la app (ONNX Runtime GenAI, ExecuTorch, LiteRT-LM, Genie)
+        @JavascriptInterface
+        public String engineInfo() {
+            return engines.info().toString();
+        }
+
+        /** {"engine","model","tokenizer","placement","ctx","temperature"} → done / error */
+        @JavascriptInterface
+        public void genLoad(final String id, final String json) {
+            new Thread(new Runnable() {
+                public void run() {
+                    try {
+                        JSONObject o = new JSONObject(json);
+                        String tok = o.optString("tokenizer", "");
+                        engines.load(o.getString("engine"), modelPath(o.getString("model")).getAbsolutePath(),
+                                tok.isEmpty() ? "" : modelPath(tok).getAbsolutePath(), o.optString("placement", "cpu"),
+                                o.optInt("ctx", 4096), (float) o.optDouble("temperature", 0.6));
+                        emit(id, "done", "");
+                    } catch (Throwable e) {
+                        emit(id, "error", e.getClass().getSimpleName() + ": " + e.getMessage());
+                    }
+                }
+            }).start();
+        }
+
+        /** Genera con el modelo cargado. Eventos: chunk (texto), done, error. */
+        @JavascriptInterface
+        public void genRun(final String id, final String json) {
+            cancelled.put(id, false);
+            new Thread(new Runnable() {
+                public void run() {
+                    try {
+                        engines.run(new JSONObject(json), new Engines.Sink() {
+                            public boolean text(String piece) {
+                                if (Boolean.TRUE.equals(cancelled.get(id))) return false;
+                                if (piece != null && !piece.isEmpty()) emit(id, "chunk", piece);
+                                return true;
+                            }
+                        });
+                        emit(id, "done", "");
+                    } catch (Throwable e) {
+                        Throwable c = e.getCause() != null ? e.getCause() : e;
+                        emit(id, "error", c.getClass().getSimpleName() + ": " + c.getMessage());
+                    }
+                }
+            }).start();
+        }
+
+        @JavascriptInterface
+        public void genStop() {
+            engines.cancel();
+        }
+
+        @JavascriptInterface
+        public void genUnload() {
+            new Thread(new Runnable() {
+                public void run() {
+                    engines.unload();
+                }
+            }).start();
         }
 
         @JavascriptInterface
@@ -353,10 +487,12 @@ public class LocalStudio {
             cancelled.put(id, false);
             new Thread(new Runnable() {
                 public void run() {
-                    File part = new File(models, new File(file).getName() + ".part");
-                    File dest = new File(models, new File(file).getName());
                     HttpURLConnection c = null;
+                    File part = null, dest = null;
                     try {
+                        dest = modelPath(file);
+                        dest.getParentFile().mkdirs();
+                        part = new File(dest.getPath() + ".part");
                         long have = part.exists() ? part.length() : 0;
                         c = (HttpURLConnection) new URL(url).openConnection();
                         c.setInstanceFollowRedirects(true);

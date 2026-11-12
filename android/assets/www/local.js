@@ -61,25 +61,181 @@
   const downloaded = () => { try { return JSON.parse(B.modelFiles()); } catch { return {}; } };
   const missingFiles = () => { const have = downloaded(); return filesOf(activeProfile()).filter((f) => !have[f.file]); };
 
-  let starting = null;
+  let starting = null, override = null;
   function ensureEngine() {
+    const r = override || resolveActive();
+    if (r.error) return Promise.reject(new Error(r.error));
+    if (r.engine !== "llamacpp") {
+      if (!starting) {
+        const ctx = (device().ramGb || 0) >= 7 ? 6144 : 4096;
+        const want = JSON.stringify({ engine: r.engine, model: r.path, tokenizer: r.tokenizer || "", placement: r.placement, ctx, temperature: 0.6 });
+        if (ensureEngine.loaded === want) return Promise.resolve();
+        B.stopEngine();  // libera la RAM de llama-server
+        starting = native((id) => B.genLoad(id, want)).then(() => { ensureEngine.loaded = want; }).finally(() => { starting = null; });
+      }
+      return starting;
+    }
+    if (ensureEngine.loaded && B.genUnload) { B.genUnload(); ensureEngine.loaded = ""; }
     const st = JSON.parse(B.engineStatus());
     const p = activeProfile(), have = downloaded();
-    if (!have[p.model.file]) return Promise.reject(new Error("Falta descargar el modelo. Abre ▤ → ⚙️ Modelos."));
-    const mm = p.mmproj && have[p.mmproj.file] ? p.mmproj.file : "";
+    const file = r.m && r.m.format === "gguf" && r.ref !== p.model.file ? r.path : p.model.file;
+    if (!have[file] && !(r.m && r.m.size)) return Promise.reject(new Error("Falta descargar el modelo. Abre ▤ → ⚙️ Modelos."));
+    const mm = file === p.model.file && p.mmproj && have[p.mmproj.file] ? p.mmproj.file : "";
     const emb = have[EMBED.file] ? EMBED.file : "";
-    if (st.chat && st.model === p.model.file + "|" + mm && (st.embed || !emb)) return Promise.resolve();
+    if (st.chat && st.model === file + "|" + mm && (st.embed || !emb)) return Promise.resolve();
     if (!starting) {
       const ctx = (device().ramGb || 0) >= 7 ? 6144 : 4096;
-      starting = native((id) => B.startEngine(id, p.model.file, mm, emb, ctx)).finally(() => { starting = null; });
+      starting = native((id) => B.startEngine(id, file, mm, emb, ctx)).finally(() => { starting = null; });
     }
     return starting;
   }
-  const hasVision = () => { const p = activeProfile(); return !!(p.mmproj && downloaded()[p.mmproj.file]); };
+  const hasVision = () => { if (resolveActive().engine !== "llamacpp") return false; const p = activeProfile(); return !!(p.mmproj && downloaded()[p.mmproj.file]); };
+
+  // ------------------------------------------------------------------ motores de inferencia
+  // llama.cpp va como proceso aparte (llama-server). ONNX Runtime GenAI, ExecuTorch, LiteRT-LM y Qualcomm Genie
+  // (APK para Snapdragon) se ejecutan dentro de la app (Engines.java). Cada modelo de la carpeta "models" se asigna
+  // al motor que lee su formato; con varios posibles gana el que más tokens/s dio en la prueba de velocidad.
+  const EINFO = (() => { try { return JSON.parse(B.engineInfo ? B.engineInfo() : "{}"); } catch { return {}; } })();
+  const HAS = EINFO.engines || { llamacpp: !!device().engine };
+  const ENGINE_ORDER = ["onnx", "openvino", "litert", "executorch", "mlc", "tensorrt", "genie", "llamacpp"];
+  const ENGINE_NAMES = { onnx: "ONNX Runtime GenAI", openvino: "OpenVINO GenAI", litert: "LiteRT-LM", executorch: "ExecuTorch",
+    mlc: "MLC LLM", tensorrt: "TensorRT-LLM", genie: "Qualcomm Genie (QNN)", llamacpp: "llama.cpp (llama-server)" };
+  const PLACEMENTS = { auto: "Automático", gpu: "GPU (memoria compartida)", cpu: "CPU (RAM)", npu: "NPU" };
+  const FORMAT_ENGINES = { gguf: ["llamacpp", "genie"], onnx: ["onnx"], executorch: ["executorch"], litert: ["litert"], genie: ["genie"] };
+  const FORMAT_LABELS = { gguf: "GGUF", onnx: "ONNX GenAI", executorch: "ExecuTorch .pte", litert: "LiteRT-LM", genie: "Qualcomm Genie" };
+  function engineState(id) {
+    if (id === "openvino") return [false, "OpenVINO no publica versión para Android (es para PC con Intel)"];
+    if (id === "mlc") return [false, "MLC LLM obliga a compilar cada modelo dentro de la propia app: no admite modelos sueltos"];
+    if (id === "tensorrt") return [false, "Solo funciona con GPUs NVIDIA de PC o servidor"];
+    if (id === "genie") {
+      if (!EINFO.qualcomm) return [false, "Necesita un procesador Snapdragon (NPU Hexagon)"];
+      if (!HAS.genie) return [false, "Instala la APK para Snapdragon (StudioIA-Android-Snapdragon.apk), que lo incluye"];
+      return [true, ""];
+    }
+    return HAS[id] ? [true, ""] : [false, "Esta APK no incluye este motor"];
+  }
+  const engineOk = (id) => engineState(id)[0];
+  function detectFormat(entry) {
+    const n = entry.name.toLowerCase(), files = (entry.files || []).map((f) => f.toLowerCase());
+    if (!entry.dir) return n.endsWith(".gguf") ? "gguf" : n.endsWith(".pte") ? "executorch" : /\.(litertlm|task)$/.test(n) ? "litert" : "";
+    if (files.includes("genai_config.json")) return "onnx";
+    if (files.includes("genie_config.json")) return "genie";
+    if (files.some((f) => f.endsWith(".pte"))) return "executorch";
+    if (files.some((f) => /\.(litertlm|task)$/.test(f))) return "litert";
+    if (files.some((f) => f.endsWith(".gguf") && !f.includes("mmproj"))) return "gguf";
+    return "";
+  }
+  function localModels() {
+    let list = [];
+    try { list = JSON.parse(B.modelList ? B.modelList() : "[]"); } catch {}
+    return list.map((e) => ({ ...e, format: detectFormat(e) }))
+      .filter((e) => e.format && e.name !== EMBED.file && !e.name.toLowerCase().includes("mmproj"));
+  }
+  function modelPaths(m) {   // rutas relativas a la carpeta models del archivo principal y del tokenizer
+    if (!m.dir) {
+      const tok = m.format === "executorch" ? "" : "";
+      return { path: m.name, tokenizer: tok };
+    }
+    const f = m.files || [], pick = (re) => f.find((x) => re.test(x));
+    const main = m.format === "executorch" ? pick(/\.pte$/i) : m.format === "litert" ? pick(/\.(litertlm|task)$/i)
+      : m.format === "gguf" ? f.find((x) => /\.gguf$/i.test(x) && !/mmproj/i.test(x)) : "";
+    const tok = pick(/^tokenizer\.(json|model)$/i) || pick(/\.tiktoken$/i) || "";
+    return { path: main ? `${m.name}/${main}` : m.name, tokenizer: tok ? `${m.name}/${tok}` : "", dir: m.name };
+  }
+  function placementsFor(engine, m) {
+    if (engine === "llamacpp" || engine === "onnx") return ["cpu"];  // llama.cpp estático y ORT de Android: CPU
+    if (engine === "executorch") return [/vulkan/i.test(modelPaths(m).path) ? "gpu" : "cpu"];  // lo fija la exportación
+    if (engine === "litert") return ["gpu", "cpu"];
+    if (engine === "genie") return m.format === "gguf" ? ["gpu", "npu", "cpu"] : ["npu"];
+    return ["cpu"];
+  }
+  const SPEED = { genie: 5, litert: 4, executorch: 3, onnx: 2, llamacpp: 1 };   // estimación sin medir
+  const activeRef = () => settings().active || activeProfile().model.file;
+  function resolve(ref) {
+    const s = settings(), want = (s.models || {})[ref] || {};
+    let m = localModels().find((x) => x.name === ref);
+    if (!m) m = { name: ref, dir: false, files: [], format: "gguf" };  // modelo del perfil aún sin descargar
+    let cands = (FORMAT_ENGINES[m.format] || []).filter(engineOk);
+    if (want.engine && want.engine !== "auto" && cands.includes(want.engine)) cands = [want.engine];
+    if (!cands.length) return { ref, m, engine: (FORMAT_ENGINES[m.format] || ["llamacpp"])[0], placement: "cpu", error: `Ningún motor de esta APK lee ${FORMAT_LABELS[m.format] || "este formato"}` };
+    const bench = (s.bench || {})[ref] || {};
+    let best = null;
+    for (const e of cands) for (const p of placementsFor(e, m)) {
+      if (want.placement && want.placement !== "auto" && p !== want.placement) continue;
+      const r = bench[`${e}|${p}`];
+      const score = r && r.tps ? 1000 + r.tps : (e === "genie" && m.format === "gguf" ? 0.5 : SPEED[e] || 0) + (p === "npu" ? 0.3 : p === "gpu" ? 0.2 : 0);
+      if (!best || score > best.score) best = { engine: e, placement: p, score };
+    }
+    if (!best) best = { engine: cands[0], placement: placementsFor(cands[0], m)[0] };
+    return { ref, m, ...modelPaths(m), engine: best.engine, placement: best.placement };
+  }
+  const resolveActive = () => resolve(activeRef());
 
   // ------------------------------------------------------------------ LLM
   const stripThink = (t) => t.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<think>[\s\S]*$/, "");
-  async function chat(messages, { onText, maxTokens = 1024, temperature = 0.6 } = {}) {
+  async function chat(messages, opts = {}) {
+    const r = override || resolveActive();
+    return r.engine === "llamacpp" ? chatLlama(messages, opts) : chatNative(r, messages, opts);
+  }
+
+  // Plantillas de chat de cada modelo (Jinja de Hugging Face) para los motores que reciben el prompt ya formateado
+  const CHATML = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+  const templates = {};
+  async function renderPrompt(r, messages) {
+    if (!templates[r.ref]) {
+      let tpl = "", special = {};
+      const dir = r.dir || "";
+      for (const name of ["chat_template.jinja", "tokenizer_config.json"]) {
+        const txt = dir ? B.modelRead(`${dir}/${name}`) : "";
+        if (!txt) continue;
+        if (name.endsWith(".jinja")) { tpl = tpl || txt; continue; }
+        try {
+          const j = JSON.parse(txt);
+          let t = j.chat_template;
+          if (Array.isArray(t)) t = (t.find((x) => x.name === "default") || t[0] || {}).template;
+          tpl = tpl || t || "";
+          for (const k of ["bos_token", "eos_token"]) { const v = j[k]; special[k] = typeof v === "object" && v ? v.content : v || ""; }
+        } catch {}
+      }
+      const { Template } = await import("./jinja.js");
+      let compiled;
+      try { compiled = new Template(tpl || CHATML); } catch { compiled = new Template(CHATML); }
+      templates[r.ref] = { compiled, special };
+    }
+    const { compiled, special } = templates[r.ref];
+    const msgs = mergeUsers(messages.map((m) => ({ role: m.role, content: textOf(m.content) })));
+    try { return compiled.render({ messages: msgs, add_generation_prompt: true, enable_thinking: false, bos_token: "", eos_token: "", ...special }); }
+    catch { const { Template } = await import("./jinja.js"); return new Template(CHATML).render({ messages: msgs, add_generation_prompt: true }); }
+  }
+  const textOf = (c) => (Array.isArray(c) ? c.filter((x) => x.type === "text").map((x) => x.text).join("\n") : String(c || ""));
+  const mergeUsers = (msgs) => msgs.reduce((out, m) => {
+    const last = out[out.length - 1];
+    if (last && last.role === m.role && m.role === "user") last.content += "\n\n" + m.content; else out.push({ ...m });
+    return out;
+  }, []);
+  const STOPS = ["<|im_end|>", "<end_of_turn>", "<|eot_id|>", "<|end|>", "<|endoftext|>", "</s>"];
+  const cutStops = (t) => STOPS.reduce((acc, s) => acc.split(s)[0], t);
+
+  async function chatNative(r, messages, { onText, maxTokens = 1024, temperature = 0.6 } = {}) {
+    await ensureEngine();
+    const ctx = (device().ramGb || 0) >= 7 ? 6144 : 4096;
+    const req = { maxTokens, temperature, ctx };
+    if (r.engine === "onnx" || r.engine === "executorch") req.prompt = await renderPrompt(r, messages);
+    else {  // LiteRT-LM y Genie aplican la plantilla del propio modelo
+      const msgs = mergeUsers(messages.map((m) => ({ role: m.role, content: textOf(m.content) })));
+      req.system = msgs[0] && msgs[0].role === "system" ? msgs.shift().content : "";
+      req.message = msgs.length && msgs[msgs.length - 1].role === "user" ? msgs.pop().content : "";
+      req.history = msgs.map((m) => ({ role: m.role === "assistant" ? "assistant" : m.role, content: m.content }));
+    }
+    let text = "";
+    await native((id) => B.genRun(id, JSON.stringify(req)), (piece) => {
+      text += piece;
+      onText && onText(stripThink(cutStops(text)));
+    });
+    return stripThink(cutStops(text)).trim();
+  }
+
+  async function chatLlama(messages, { onText, maxTokens = 1024, temperature = 0.6 } = {}) {
     let text = "";
     const body = { messages, stream: true, temperature, max_tokens: maxTokens, cache_prompt: true,
       chat_template_kwargs: { enable_thinking: false } };
@@ -339,10 +495,10 @@
   async function pull(name, emit) {
     const s = settings();
     let files;
-    if (PROFILES[name]) { s.profile = name; kv.set("settings", s); files = filesOf(PROFILES[name]); }
+    if (PROFILES[name]) { s.profile = name; delete s.active; kv.set("settings", s); files = filesOf(PROFILES[name]); }
     else if (/^https?:\/\/.+\.gguf(\?.*)?$/i.test(name)) {
       const file = decodeURIComponent(name.split("?")[0].split("/").pop());
-      s.profile = "custom"; s.custom = { file, url: name }; kv.set("settings", s);
+      s.profile = "custom"; s.custom = { file, url: name }; delete s.active; kv.set("settings", s);
       files = [s.custom, EMBED];
     } else files = filesOf(activeProfile()).filter((f) => f.file === name);
     if (!files.length) return emit({ error: "Modelo desconocido. Elige un perfil o pega la URL de un archivo .gguf" });
@@ -353,9 +509,104 @@
       await native((id) => B.download(id, f.url, f.file), (p) => { const j = JSON.parse(p); emit({ status: `descargando ${f.file} (${(j.completed / 1e9).toFixed(2)} de ${(j.total / 1e9).toFixed(2)} GB)`, completed: j.completed, total: j.total }); });
     }
     emit({ status: "arrancando el motor…" });
-    B.stopEngine();
+    resetEngine();
     await ensureEngine();
     emit({ status: "listo" });
+  }
+
+  // ------------------------------------------------------------------ motores: estado, ajustes, medición, descargas HF
+  function enginesStatus() {
+    const s = settings(), d = device(), roles = { chat: activeRef() };
+    const list = localModels(), prof = activeProfile().model.file;
+    if (!list.some((m) => m.name === prof)) list.unshift({ name: prof, dir: false, files: [], format: "gguf", size: 0, pending: true });
+    const models = list.map((m) => {
+      const r = resolve(m.name), want = (s.models || {})[m.name] || {};
+      const options = (FORMAT_ENGINES[m.format] || []).filter(engineOk).map((e) => ({ engine: e, name: ENGINE_NAMES[e], placements: placementsFor(e, m) }));
+      return { ref: m.name, format: m.format, format_label: FORMAT_LABELS[m.format] + (m.pending ? " · sin descargar" : ""), size_gb: m.size ? Math.round(m.size / 1e8) / 10 : 0,
+        options, setting: { engine: want.engine || "auto", placement: want.placement || "auto" }, bench: (s.bench || {})[m.name] || {},
+        roles: Object.keys(roles).filter((k) => roles[k] === m.name),
+        chosen: r.error ? { error: r.error } : { engine: r.engine, engine_name: ENGINE_NAMES[r.engine], placement: r.placement } };
+    });
+    const soc = [EINFO.socMaker, EINFO.soc].filter(Boolean).join(" ") || EINFO.hardware || "";
+    return {
+      hardware: { cpu: (EINFO.model || "Móvil") + (soc ? ` · ${soc}` : ""), ram_gb: d.ramGb || 0,
+        gpus: EINFO.vulkan ? [{ name: "GPU con Vulkan" + (EINFO.qualcomm ? " (Adreno)" : ""), vram_gb: 0 }] : [],
+        npus: EINFO.qualcomm ? [{ name: "Hexagon (Qualcomm)" }] : [] },
+      engines: ENGINE_ORDER.map((id) => { const [ok, reason] = engineState(id); return { id, name: ENGINE_NAMES[id], available: ok, reason, installable: false }; }),
+      models, roles, placements: PLACEMENTS, models_dir: "la carpeta de modelos de la app (Android/data/com.studioia.local)",
+    };
+  }
+  function resetEngine() {
+    if (B.genUnload) B.genUnload();
+    ensureEngine.loaded = "";
+    B.stopEngine();
+  }
+  function updateEngineSettings(body) {
+    const s = settings();
+    s.models = s.models || {};
+    for (const [ref, v] of Object.entries(body.models || {})) s.models[ref] = { ...(s.models[ref] || {}), engine: v.engine || "auto", placement: v.placement || "auto" };
+    const roles = body.roles || {};
+    if (roles.chat || roles.code) s.active = roles.chat || roles.code;
+    kv.set("settings", s);
+    resetEngine();
+    return enginesStatus();
+  }
+  async function benchmark(ref, emit, maxTokens = 64) {
+    const s = settings(), r0 = resolve(ref);
+    const combos = [];
+    for (const e of (FORMAT_ENGINES[r0.m.format] || []).filter(engineOk)) for (const p of placementsFor(e, r0.m)) combos.push([e, p]);
+    if (!combos.length) return emit({ status: "error", error: "No hay motores disponibles para este modelo" });
+    const results = {};
+    for (const [e, p] of combos) {
+      const label = `${ENGINE_NAMES[e]} · ${PLACEMENTS[p] || p}`;
+      emit({ status: "running", combo: `${e}|${p}`, label });
+      override = { ...r0, engine: e, placement: p };
+      try {
+        resetEngine();
+        await ensureEngine();
+        const t0 = performance.now(); let first = 0, pieces = 0;
+        const msgs = [{ role: "user", content: "Escribe un párrafo sobre la historia de la imprenta." }];
+        await chat(msgs, { maxTokens, temperature: 0, onText: () => { pieces++; if (!first) first = performance.now(); } });
+        const end = performance.now();
+        const tps = first && end > first ? Math.round((Math.max(pieces - 1, 1) / ((end - first) / 1000)) * 10) / 10 : 0;
+        const res = { tps, ttft: Math.round((first - t0) / 100) / 10 };
+        results[`${e}|${p}`] = res;
+        emit({ status: "result", combo: `${e}|${p}`, label, ...res });
+      } catch (ex) {
+        results[`${e}|${p}`] = { error: String(ex.message || ex).slice(0, 400) };
+        emit({ status: "result", combo: `${e}|${p}`, label, error: String(ex.message || ex).slice(0, 400) });
+      }
+    }
+    override = null;
+    resetEngine();
+    const s2 = settings(); s2.bench = s2.bench || {}; s2.bench[ref] = results; kv.set("settings", s2);
+    const best = Object.entries(results).filter(([, x]) => x.tps).sort((a, b) => b[1].tps - a[1].tps)[0];
+    emit({ status: "done", best: best ? best[0] : null, results });
+  }
+  // Hugging Face: "org/repo" o "org/repo/subcarpeta"; se baja a models/org--repo[--subcarpeta]/ (archivos de primer nivel)
+  async function downloadHF(repo, include, emit) {
+    const parts = String(repo || "").replace(/^hf:/, "").replace(/^https:\/\/huggingface\.co\//, "").split("/").filter(Boolean);
+    if (parts.length < 2) return emit({ error: "Escribe el repositorio como organización/nombre" });
+    const id = parts.slice(0, 2).join("/"), sub = parts.slice(2).join("/");
+    const dir = [parts[0], parts[1], ...parts.slice(2)].join("--");
+    const listFile = `.hf-${Date.now()}.json`;
+    emit({ status: "consultando Hugging Face…" });
+    await native((nid) => B.download(nid, `${HF}api/models/${id}/tree/main${sub ? "/" + sub : ""}`, listFile));
+    let tree = [];
+    try { tree = JSON.parse(B.modelRead(listFile)); } finally { B.deleteModel(listFile); }
+    const re = include ? new RegExp(include.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")) : null;
+    const files = tree.filter((f) => f.type === "file" && (!re || re.test(f.path.split("/").pop())));
+    if (!files.length) return emit({ error: "El repositorio no tiene archivos (o la subcarpeta no existe)" });
+    const total = files.reduce((a, f) => a + (f.size || 0), 0);
+    let done = 0;
+    for (const f of files) {
+      const name = f.path.split("/").pop();
+      emit({ status: `descargando ${name}`, completed: done, total });
+      await native((nid) => B.download(nid, `${HF}${id}/resolve/main/${f.path.split("/").map(encodeURIComponent).join("/")}`, `${dir}/${name}`),
+        (p) => { const j = JSON.parse(p); emit({ status: `descargando ${name} (${((done + j.completed) / 1e9).toFixed(2)} de ${(total / 1e9).toFixed(2)} GB)`, completed: done + j.completed, total }); });
+      done += f.size || 0;
+    }
+    emit({ status: "listo", done: true, model: dir });
   }
 
   // ------------------------------------------------------------------ enrutador /api
@@ -373,18 +624,27 @@
 
   async function route(method, path, q, body, raw) {
     let m;
-    if (path === "/api/ping") return json({ app: "studio-ia-local", version: "1.1.0", auth: false, local: true });
+    if (path === "/api/ping") return json({ app: "studio-ia-local", version: "1.3.0", auth: false, local: true });
     if (path === "/api/health") {
-      const st = JSON.parse(B.engineStatus()), p = activeProfile(), have = downloaded(), d = device();
-      const missing = missingFiles().map((f) => f.file);
-      if (!missing.length && !st.chat && !starting && d.engine) ensureEngine().catch(() => {});
-      return json({ version: "1.1.0", local: true, engine: "Motor llama.cpp", ollama: st.chat, starting: !!starting, error: st.error, device: d,
-        models: Object.keys(have).map((f) => `${f} (${(have[f] / 1e9).toFixed(2)} GB)`),
-        config: { chat: p.model.file, "visión": p.mmproj ? p.mmproj.file : "no incluida en este perfil", memoria: EMBED.file },
+      const st = JSON.parse(B.engineStatus()), p = activeProfile(), have = downloaded(), d = device(), r = resolveActive();
+      const inApp = r.engine !== "llamacpp" && !r.error;
+      const missing = inApp ? [] : missingFiles().map((f) => f.file);
+      const ready = inApp ? !!ensureEngine.loaded : st.chat;
+      if (!missing.length && !ready && !starting && (inApp || d.engine)) ensureEngine().catch(() => {});
+      return json({ version: "1.3.0", local: true, engine: (ENGINE_NAMES[r.engine] || "Motor") + (r.placement ? ` · ${PLACEMENTS[r.placement] || r.placement}` : ""),
+        ollama: ready, starting: !!starting, error: r.error || st.error, device: d,
+        models: [...Object.keys(have).map((f) => `${f} (${(have[f] / 1e9).toFixed(2)} GB)`),
+          ...localModels().filter((m) => m.dir).map((m) => `${m.name}/ (${(m.size / 1e9).toFixed(2)} GB)`)],
+        config: { chat: r.ref, "visión": inApp ? "solo con llama.cpp" : p.mmproj ? p.mmproj.file : "no incluida en este perfil", memoria: EMBED.file },
         missing, multimodal: { stt: true, tts: true, image: false },
         recommended: Object.fromEntries(Object.entries(PROFILES).map(([id, pr]) => [pr.label, [id]])) });
     }
-    if (path === "/api/models/pull") return streamResponse("ndjson", (emit) => pull(body.model, emit));
+    if (path === "/api/models/pull") return streamResponse("ndjson", (emit) => /^hf:/.test(body.model || "") ? downloadHF(body.model, "", emit) : pull(body.model, emit));
+    if (path === "/api/engines" && method === "GET") return json(enginesStatus());
+    if (path === "/api/engines/settings") return json(updateEngineSettings(body));
+    if (path === "/api/engines/benchmark") return streamResponse("ndjson", (emit) => benchmark(body.model, emit, body.max_tokens || 64));
+    if (path === "/api/models/download") return streamResponse("ndjson", (emit) => downloadHF(body.repo, body.include || "", emit));
+    if (/^\/api\/engines\/[\w-]+\/install$/.test(path)) return json({ detail: "En el móvil los motores vienen dentro de la APK; no se instalan aparte" }, 501);
 
     if (path === "/api/conversations" && method === "GET") return json(kv.get("conversations", []));
     if (path === "/api/conversations" && method === "POST") return json({ id: uid() });

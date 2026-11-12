@@ -135,3 +135,13 @@ h3 { margin: 6px 0 0; font-size: 14px; }
   .topbar select { max-width: 46vw; }
 }
 #scrim.show { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 10; }
+
+/* Motores de inferencia */
+.engines { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.eng { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 10px; border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; cursor: help; }
+.eng.ok { color: var(--accent2); border-color: var(--accent2); }
+.eng.off { color: var(--muted); }
+.eng button { text-transform: none; letter-spacing: 0; padding: 2px 8px; font-family: inherit; }
+.model-row { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; margin: 6px 0; background: var(--panel); }
+.model-row select { max-width: 100%; }

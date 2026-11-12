@@ -236,3 +236,4 @@ launcher/rsrc_windows_amd64.syso
 studio.env
 # Binarios pesados: se publican como adjuntos de la Release
 android/jniLibs/
+backend/tests/.tiny/
